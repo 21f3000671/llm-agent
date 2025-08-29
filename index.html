@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LLM Agent POC (Browser, Multi‑Tool)</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <style>
+    body { background:#0b0f14; color:#e6edf3 }
+    .chat { height: 52vh; overflow:auto; background:#0f1620; border:1px solid #1f2a37; border-radius: .75rem; padding:.75rem }
+    .msg { white-space: pre-wrap; }
+    .msg.user { background:#102a43; border-left:3px solid #2d81ff }
+    .msg.agent { background:#16212b; border-left:3px solid #7ee787 }
+    .msg.tool { background:#1a2430; border-left:3px solid #d29922 }
+    .msg, .toolcard { border-radius:.5rem; padding:.5rem .75rem; margin:.4rem 0 }
+    code, pre { color:#d1eaff }
+    .footer { font-size:.85rem; opacity:.7 }
+  </style>
+</head>
+<body class="p-3 container">
+  <header class="d-flex align-items-center gap-2 mb-3">
+    <h4 class="me-auto m-0">LLM Agent POC</h4>
+    <button id="configBtn" class="btn btn-outline-light btn-sm">Configure Provider</button>
+  </header>
+
+  <div class="row g-3">
+    <div class="col-12 col-md-8">
+      <div id="chat" class="chat"></div>
+      <div class="input-group mt-2">
+        <input id="userInput" class="form-control" placeholder="Ask me anything… e.g., ‘Interview me to create a blog post’" />
+        <button id="sendBtn" class="btn btn-primary">Send</button>
+      </div>
+      <div id="alerts" class="mt-2"></div>
+    </div>
+    <div class="col-12 col-md-4">
+      <div class="card bg-dark border-secondary">
+        <div class="card-body">
+          <div class="mb-2">
+            <label class="form-label text-white">Model</label>
+            <select id="model" class="form-select form-select-sm bg-dark text-light">
+              <option value="gpt-4o-mini">gpt-4o-mini</option>
+            </select>
+          </div>
+          <div class="mb-2">
+            <label class="form-label text-white">Google CSE key (optional)</label>
+            <input id="gkey" class="form-control form-control-sm bg-dark text-light" placeholder="GOOGLE_API_KEY" />
+          </div>
+          <div class="mb-3">
+            <label class="form-label text-white">Google CSE cx (optional)</label>
+            <input id="gcx" class="form-control form-control-sm bg-dark text-light" placeholder="SEARCH_ENGINE_ID" />
+          </div>
+          <div class="d-grid gap-2">
+            <button id="saveSearchKeys" class="btn btn-outline-secondary btn-sm">Save search config</button>
+            <button id="clearChat" class="btn btn-outline-secondary btn-sm">Clear chat</button>
+            <button id="demoBtn" class="btn btn-outline-info btn-sm">Run IBM demo</button>
+          </div>
+          <p class="footer mt-3 mb-0 text-white">Tools: web search (Google/duck), AI Pipe proxy, sandboxed JS runner</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- hidden sandbox for JS execution -->
+  <iframe id="sandbox" sandbox="allow-scripts" style="display:none"></iframe>
+
+  <script type="module">
+    // ————— Imports (ESM over CDN) —————
+    import { openaiConfig } from "https://cdn.jsdelivr.net/npm/bootstrap-llm-provider@1.3.1";
+    import { bootstrapAlert } from "https://cdn.jsdelivr.net/npm/bootstrap-alert@1";
+
+    // ————— Provider state —————
+    let provider = { baseUrl: "https://aipipe.org/openai/v1", apiKey: "", models: ["gpt-4o-mini"] };
+    const modelSel = document.getElementById('model');
+
+    async function configureProvider(force=false) {
+      try {
+        const { baseUrl, apiKey, models } = await openaiConfig({
+          defaultBaseUrls: [
+            "https://aipipe.org/openai/v1",
+            "https://api.openai.com/v1",
+            "https://openrouter.ai/api/v1"
+          ],
+          show: force,
+          help: '<div class="alert alert-info">Tip: To use <b>AI Pipe</b>, log in at <a href="https://aipipe.org/login" target="_blank">aipipe.org/login</a> and paste the token as your API key.</div>'
+        });
+        provider = { baseUrl, apiKey, models };
+        // Populate model list
+        modelSel.innerHTML = '';
+        (models || ["gpt-4o-mini"]).slice(0, 50).forEach(m => {
+          const opt = document.createElement('option'); opt.value = m.id || m; opt.textContent = m.id || m; modelSel.appendChild(opt);
+        });
+        bootstrapAlert({ title: 'Provider configured', body: `${baseUrl}`, color: 'success', delay: 2500 });
+      } catch (err) {
+        bootstrapAlert({ title: 'Provider error', body: err.message, color: 'danger', autohide: false });
+      }
+    }
+
+    document.getElementById('configBtn').onclick = () => configureProvider(true);
+
+    // Try auto-config on load (won't show modal if cached)
+    configureProvider(false);
+
+    // ————— Simple chat UI helpers —————
+    const chatEl = document.getElementById('chat');
+    function addMsg(role, text) {
+      const div = document.createElement('div');
+      div.className = `msg ${role}`;
+      div.innerHTML = `<div class='small text-secondary mb-1'>${role}</div><div>${text}</div>`;
+      chatEl.appendChild(div); chatEl.scrollTop = chatEl.scrollHeight;
+    }
+
+    // ————— Search config —————
+    const gkey = document.getElementById('gkey');
+    const gcx  = document.getElementById('gcx');
+    // Load from localStorage if present
+    gkey.value = localStorage.getItem('google_cse_key') || '';
+    gcx.value  = localStorage.getItem('google_cse_cx')  || '';
+    document.getElementById('saveSearchKeys').onclick = () => {
+      localStorage.setItem('google_cse_key', gkey.value.trim());
+      localStorage.setItem('google_cse_cx',  gcx.value.trim());
+      bootstrapAlert({ body: 'Saved search settings', color: 'secondary', delay: 1500 });
+    };
+
+    // ————— Tool implementations —————
+    async function tool_search_snippets({ query, max_results = 3 }) {
+      const key = (localStorage.getItem('google_cse_key')||'').trim();
+      const cx  = (localStorage.getItem('google_cse_cx')||'').trim();
+      try {
+        if (key && cx) {
+          // Google CSE via AI Pipe proxy
+          const url = `https://aipipe.org/proxy/` + encodeURIComponent(
+            `https://www.googleapis.com/customsearch/v1?key=${key}&cx=${cx}&num=${max_results}&q=${encodeURIComponent(query)}`
+          );
+          const data = await fetch(url).then(r=>r.json());
+          const items = (data.items||[]).map(i=>({ title: i.title, link: i.link, snippet: i.snippet }));
+          return { provider: 'google_cse', items };
+        }
+        // Fallback: DuckDuckGo Instant Answer API via AI Pipe proxy
+        const url = `https://aipipe.org/proxy/` + encodeURIComponent(
+          `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_redirect=1&no_html=1`
+        );
+        const data = await fetch(url).then(r=>r.json());
+        const items = [];
+        if (data.AbstractText) items.push({ title: data.Heading||'DuckDuckGo', link: data.AbstractURL, snippet: data.AbstractText });
+        (data.RelatedTopics||[]).slice(0, max_results-1).forEach(t=>{
+          if (t.Text) items.push({ title: t.Text.split(' - ')[0], link: (t.FirstURL||''), snippet: t.Text });
+        });
+        return { provider: 'duckduckgo', items };
+      } catch (e) {
+        throw new Error('Search failed: ' + e.message);
+      }
+    }
+
+    async function tool_proxy_fetch({ method='GET', url, headers={}, body=null }) {
+      if (!/^https?:\/\//i.test(url)) throw new Error('URL must start with http/https');
+      const proxied = `https://aipipe.org/proxy/` + encodeURIComponent(url);
+      const res = await fetch(proxied, { method, headers, body });
+      const text = await res.text();
+      let json; try { json = JSON.parse(text); } catch {}
+      return { status: res.status, ok: res.ok, headers: Object.fromEntries(res.headers.entries()), body: json || text };
+    }
+
+    // Sandbox runner via hidden iframe
+    function ensureSandbox() {
+      const iframe = document.getElementById('sandbox');
+      if (!iframe.srcdoc) {
+        iframe.srcdoc = `<!doctype html><body><script>\n`+
+        `window.addEventListener('message', async (e)=>{\n`+
+        `  const code = (e.data||{}).code; if (typeof code !== 'string') return;\n`+
+        `  try { const out = await (async()=>eval(code))(); parent.postMessage({ ok:true, result:String(out) }, '*'); }\n`+
+        `  catch(err){ parent.postMessage({ ok:false, error: String(err.message||err) }, '*'); }\n`+
+        `});\n<\/script>`;
+      }
+      return iframe;
+    }
+
+    function run_in_sandbox(code) {
+      ensureSandbox();
+      return new Promise((resolve) => {
+        const onMsg = (e)=>{ window.removeEventListener('message', onMsg); resolve(e.data); };
+        window.addEventListener('message', onMsg);
+        document.getElementById('sandbox').contentWindow.postMessage({ code }, '*');
+      });
+    }
+
+    async function tool_run_js({ code }) {
+      const result = await run_in_sandbox(code);
+      if (!result.ok) throw new Error(result.error);
+      return { output: result.result };
+    }
+
+    // ————— OpenAI tool schema (function calling) —————
+    const tools = [
+      {
+        type: 'function',
+        function: {
+          name: 'search_snippets',
+          description: 'Search the web and return up to max_results snippets. Prefers Google CSE if configured, else DuckDuckGo.',
+          parameters: {
+            type: 'object',
+            properties: {
+              query: { type:'string' },
+              max_results: { type:'integer', minimum:1, maximum:5, default:3 }
+            },
+            required: ['query']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'proxy_fetch',
+          description: 'HTTP fetch via AI Pipe proxy (bypasses CORS). WARNING: only use for trusted URLs. Returns status, headers, and body (JSON or text).',
+          parameters: {
+            type: 'object',
+            properties: {
+              method: { type:'string', enum:['GET','POST','PUT','PATCH','DELETE'], default:'GET' },
+              url: { type:'string' },
+              headers: { type:'object', additionalProperties: { type:'string' } },
+              body: { type:['string','null'] }
+            },
+            required: ['url']
+          }
+        }
+      },
+      {
+        type: 'function',
+        function: {
+          name: 'run_js',
+          description: 'Securely evaluate JavaScript code in a sandboxed iframe and return the stringified result.',
+          parameters: {
+            type: 'object',
+            properties: { code: { type:'string' } },
+            required: ['code']
+          }
+        }
+      }
+    ];
+
+    // ————— Core agent loop —————
+    const systemPrompt = `You are a browser-based agent.\n`+
+      `Use tools when helpful.\n`+
+      `- search_snippets: to look up facts or find context.\n`+
+      `- proxy_fetch: to call APIs or scrape JSON/text via the AI Pipe proxy.\n`+
+      `- run_js: to execute small JS snippets the user asks for.\n`+
+      `When you call tools, keep arguments minimal. After tools return, synthesize results for the user.`;
+
+    const messages = [ { role:'system', content: systemPrompt } ];
+
+    async function callLLM() {
+      const model = modelSel.value || 'gpt-4o-mini';
+      const body = { model, messages, tools, tool_choice: 'auto' };
+      const res = await fetch(`${provider.baseUrl.replace(/\/$/,'')}/chat/completions`, {
+        method:'POST',
+        headers: { 'Content-Type':'application/json', 'Authorization': provider.apiKey ? `Bearer ${provider.apiKey}` : '' },
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) throw new Error(`LLM error ${res.status}`);
+      const data = await res.json();
+      const choice = data.choices?.[0];
+      return choice?.message || {};
+    }
+
+    async function handleToolCall(tc) {
+      const name = tc.function?.name; let args={};
+      try { args = JSON.parse(tc.function?.arguments||'{}'); } catch {}
+      if (name === 'search_snippets') return await tool_search_snippets(args);
+      if (name === 'proxy_fetch')    return await tool_proxy_fetch(args);
+      if (name === 'run_js')         return await tool_run_js(args);
+      throw new Error('Unknown tool '+name);
+    }
+
+    async function loopOnce() {
+      const msg = await callLLM();
+      if (msg.content) { addMsg('agent', msg.content); messages.push({ role:'assistant', content: msg.content, tool_calls: msg.tool_calls }); }
+
+      // Execute tools if requested
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length) {
+        for (const tc of msg.tool_calls) {
+          try {
+            const result = await handleToolCall(tc);
+            const pretty = '```json\n'+JSON.stringify(result, null, 2)+'\n```';
+            addMsg('tool', pretty);
+            messages.push({ role:'tool', tool_call_id: tc.id, name: tc.function.name, content: JSON.stringify(result) });
+          } catch (err) {
+            bootstrapAlert({ title:'Tool failed', body: err.message, color:'danger', autohide:false });
+            messages.push({ role:'tool', tool_call_id: tc.id, name: tc.function.name, content: JSON.stringify({ error: err.message }) });
+          }
+        }
+        // After tools, ask the LLM again to integrate
+        return await loopOnce();
+      }
+    }
+
+    // ————— Events —————
+    document.getElementById('sendBtn').onclick = async () => {
+      const inp = document.getElementById('userInput');
+      const text = inp.value.trim();
+      if (!text) return; inp.value = '';
+      addMsg('user', text); messages.push({ role:'user', content: text });
+      try { await loopOnce(); } catch (e) { bootstrapAlert({ title:'Chat error', body: e.message, color:'danger', autohide:false }); }
+    };
+
+    document.getElementById('clearChat').onclick = () => {
+      chatEl.innerHTML = ''; messages.splice(1); bootstrapAlert({ body:'Cleared', color:'secondary', delay:1000 });
+    };
+
+    document.getElementById('demoBtn').onclick = async () => {
+      const demo = ["Interview me to create a blog post.", "About IBM", "Next step, please."];
+      for (const line of demo) {
+        addMsg('user', line); messages.push({ role:'user', content: line });
+        try { await loopOnce(); } catch(e){ bootstrapAlert({ title:'Error', body:e.message, color:'danger', autohide:false }); break; }
+      }
+    };
+
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
